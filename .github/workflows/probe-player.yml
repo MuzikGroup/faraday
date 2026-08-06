@@ -1,0 +1,124 @@
+name: Probe YouTube Player
+
+"on":
+  repository_dispatch:
+    types: [faraday-player-cron]
+  workflow_dispatch:
+    inputs:
+      player_hashes:
+        description: Optional comma-separated regional player hashes
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: probe-youtube-player
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.FARADAY_RELEASE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.1
+
+      - name: Cache dependencies
+        run: deno cache --frozen src/*.ts src/zemer/*.ts scripts/*.ts test/*.ts test/integration/*.ts
+
+      - name: Detect new player
+        id: detect-player
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PROBE_CHECK_ONLY: "1"
+          PLAYER_HASHES: ${{ github.event.client_payload.player_hashes || inputs.player_hashes || '' }}
+        run: deno task --frozen probe:player
+
+      - name: Verify required secrets
+        if: steps.detect-player.outputs.new_player == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          YT_COOKIE: ${{ secrets.YT_COOKIE }}
+          YT_VISITOR_DATA: ${{ secrets.YT_VISITOR_DATA }}
+        run: |
+          test -n "${DISCORD_WEBHOOK_URL}" || { echo "::error::DISCORD_WEBHOOK_URL is required"; exit 1; }
+          test -n "${YT_VISITOR_DATA}" || { echo "::error::YT_VISITOR_DATA is required"; exit 1; }
+          case "${YT_COOKIE}" in
+            *SAPISID=*) ;;
+            *) echo "::error::YT_COOKIE must include SAPISID"; exit 1 ;;
+          esac
+
+      - name: Verify
+        if: steps.detect-player.outputs.new_player == 'true'
+        run: deno task --frozen ci
+
+      - name: Probe current player
+        if: steps.detect-player.outputs.new_player == 'true'
+        id: probe-player
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          YT_COOKIE: ${{ secrets.YT_COOKIE }}
+          YT_VISITOR_DATA: ${{ secrets.YT_VISITOR_DATA }}
+          YT_DATASYNC_ID: ${{ secrets.YT_DATASYNC_ID }}
+          PLAYER_HASHES: ${{ steps.detect-player.outputs.probe_player_hashes }}
+          CURRENT_PLAYER_HASH: ${{ steps.detect-player.outputs.current_player_hash }}
+        run: deno task --frozen probe:player
+
+      - name: Verify generated artifacts
+        if: steps.probe-player.outputs.processed_player == 'true'
+        run: deno task --frozen ci
+
+      - name: Commit registry update
+        if: steps.probe-player.outputs.processed_player == 'true'
+        id: auto-commit
+        uses: stefanzweifel/git-auto-commit-action@v7.2.0
+        with:
+          commit_message: "Update YouTube player registry"
+          commit_user_name: ${{ github.actor }}
+          commit_user_email: ${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com
+          commit_author: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          file_pattern: registry/player-registry.json registry/player_configs.json registry/releases/*.json
+
+      - name: Create player release
+        if: steps.probe-player.outputs.processed_player == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FARADAY_RELEASE_TOKEN || github.token }}
+        run: |
+          CONFIG_PATH="registry/player_configs.json"
+          test -f "${CONFIG_PATH}"
+          IFS=',' read -ra PLAYER_HASHES <<< "${{ steps.probe-player.outputs.processed_player_hashes }}"
+          for PLAYER_HASH in "${PLAYER_HASHES[@]}"; do
+            TAG="player-${PLAYER_HASH}"
+            RELEASE_PATH="registry/releases/${PLAYER_HASH}.json"
+            PLAYER_URL="https://www.youtube.com/s/player/${PLAYER_HASH}/player_ias.vflset/en_GB/base.js"
+            test -f "${RELEASE_PATH}"
+            jq -e --arg hash "${PLAYER_HASH}" '[.players | to_entries[] | select(.key == $hash or (((.value.aliases // []) | index($hash)) != null)) | .value][0] | .sig and .nClass and (.sts > 0)' "${CONFIG_PATH}" >/dev/null
+            jq -e --arg hash "${PLAYER_HASH}" --arg url "${PLAYER_URL}" '.playerHash == $hash and .playerUrl == $url' "${RELEASE_PATH}" >/dev/null
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "${TAG} already exists."
+            else
+              git tag "${TAG}"
+              git push origin "refs/tags/${TAG}"
+            fi
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              echo "Release ${TAG} already exists."
+              gh release upload "${TAG}" "${RELEASE_PATH}#player-${PLAYER_HASH}.json" "${CONFIG_PATH}#player_configs.json" --clobber
+            else
+              gh release create "${TAG}" \
+                "${RELEASE_PATH}#player-${PLAYER_HASH}.json" \
+                "${CONFIG_PATH}#player_configs.json" \
+                --verify-tag \
+                --title "YouTube player ${PLAYER_HASH}" \
+                --notes "Faraday cipher config for YouTube player ${PLAYER_HASH}. See player_configs.json for sig/nClass/sts entries."
+            fi
+          done
